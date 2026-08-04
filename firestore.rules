@@ -12,16 +12,34 @@ service cloud.firestore {
     // Config document: anyone authenticated can read, only admins write
     match /operacoes/config {
       allow read: if request.auth != null;
-      allow write: if request.auth != null;
+      allow write: if request.auth != null
+        && (!('turnos' in request.resource.data) || request.resource.data.turnos is list)
+        && (!('metasHistorico' in request.resource.data) || request.resource.data.metasHistorico is list)
+        && (!('tecnicos' in request.resource.data) || request.resource.data.tecnicos is list)
+        && (!('ativos' in request.resource.data) || request.resource.data.ativos is list);
       // TODO: restrict write to admin UIDs after setting up admin list:
       // allow write: if request.auth.uid in ['ADMIN_UID_1', 'ADMIN_UID_2'];
     }
 
-    // Daily operation documents: authenticated users can read/write
+    // Trilha de auditoria: guardada como um doc único com array 'lista'. A lista só
+    // pode crescer — nenhum cliente consegue apagar ou encurtar o histórico já salvo
+    // (não impede alterar o conteúdo de entradas antigas sem reescrever tudo, mas
+    // pelo menos nenhuma gravação consegue reduzir o tamanho da trilha existente).
+    match /operacoes/auditoria {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null
+        && (!('lista' in resource.data) || !('lista' in request.resource.data)
+            || request.resource.data.lista.size() >= resource.data.lista.size());
+    }
+
+    // Demais documentos da coleção (um por dia + pedidos/almoxarifado/manutencao/
+    // manut_cadastros/feedbacks/planilhas/ui_custom): autenticado pode ler/escrever,
+    // com um limite de chaves de nível raiz por documento.
     match /operacoes/{dayDoc} {
       allow read: if request.auth != null;
       allow write: if request.auth != null
-        && request.resource.data.keys().size() <= 20;  // limit sectors per day
+        && dayDoc != 'config' && dayDoc != 'auditoria'
+        && request.resource.data.keys().size() <= 20;
     }
 
     // Block everything else
