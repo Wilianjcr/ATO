@@ -3942,34 +3942,84 @@
     var _syncMaxRetries = 3;
     var _pendingSync = false;
 
-    /** Executa o envio imediato ao Firestore (sem debounce) */
+    /** Última versão (_versao) conhecida de cada setor, para detectar edição concorrente */
+    var _sectorVersions = {};
+
+    function _atualizarVersoesConhecidas(dayData) {
+        if (!dayData) return;
+        Object.keys(dayData).forEach(function(key){
+            if (key === '_ops' || key === '_registros_atv') return;
+            var s = dayData[key];
+            if (s && typeof s === 'object') _sectorVersions[key] = s._versao || 0;
+        });
+    }
+
+    /** Executa o envio imediato ao Firestore (sem debounce). Só grava o setor atual
+     *  (não o dia inteiro) dentro de uma transaction com contador _versao — se outro
+     *  usuário já salvou uma versão mais nova desde o último carregamento deste
+     *  cliente, aborta e recarrega em vez de sobrescrever às cegas. */
     function _executarSyncFirestore() {
-        var dayData = appData[workingDate];
-        if (dayData) {
-            var payload = JSON.parse(JSON.stringify(dayData));
-            if (currentSector && payload[currentSector]) {
-                payload[currentSector]._lastModifiedAt = Date.now();
-                payload[currentSector]._lastModifiedBy = operadorNome || '';
-            }
-            db.collection('operacoes').doc(dateToDocId(workingDate))
-              .set(payload, { merge: true })
-              .then(function(){ mostrarIndicadorNuvem(); _syncRetryCount = 0; })
-              .catch(function(e){
-                  console.warn('[Firebase] salvar dia:', e.message);
-                  _syncRetryCount++;
-                  if (_syncRetryCount <= _syncMaxRetries) {
-                      setTimeout(function(){ salvarNoFirestore(); }, 5000 * _syncRetryCount);
-                  } else {
-                      console.warn('[Prumo] Sync falhou após ' + _syncMaxRetries + ' tentativas. Dados seguros no localStorage.');
-                      _pendingSync = true;
-                  }
-              });
-        }
+        _salvarSetorAtualComTransacao();
         if (appData.config) {
             db.collection('operacoes').doc('config')
               .set(JSON.parse(JSON.stringify(appData.config)), { merge: true })
               .catch(function(e){ console.warn('[Firebase] salvar config:', e.message); });
         }
+    }
+
+    function _salvarSetorAtualComTransacao() {
+        var dayData = appData[workingDate];
+        if (!dayData || !currentSector || !dayData[currentSector]) return;
+        var docRef = db.collection('operacoes').doc(dateToDocId(workingDate));
+        var setorSnapshot = JSON.parse(JSON.stringify(dayData[currentSector]));
+        var opsSnapshot = (dayData['_ops'] && dayData['_ops'][currentSector] !== undefined)
+            ? JSON.parse(JSON.stringify(dayData['_ops'][currentSector])) : undefined;
+        var registrosSnapshot = (dayData['_registros_atv'] && dayData['_registros_atv'][currentSector] !== undefined)
+            ? JSON.parse(JSON.stringify(dayData['_registros_atv'][currentSector])) : undefined;
+        var setorAlvo = currentSector;
+
+        db.runTransaction(function(transaction){
+            return transaction.get(docRef).then(function(doc){
+                var remoto = doc.exists ? (doc.data() || {}) : {};
+                var remotoSetor = remoto[setorAlvo] || {};
+                var versaoRemota = remotoSetor._versao || 0;
+                var versaoConhecida = _sectorVersions[setorAlvo] || 0;
+                if (versaoRemota > versaoConhecida) {
+                    var erro = new Error('conflito de edição');
+                    erro._conflito = true;
+                    throw erro;
+                }
+                setorSnapshot._versao = versaoRemota + 1;
+                setorSnapshot._lastModifiedAt = Date.now();
+                setorSnapshot._lastModifiedBy = operadorNome || '';
+                var update = {};
+                update[setorAlvo] = setorSnapshot;
+                if (opsSnapshot !== undefined) { update['_ops'] = {}; update['_ops'][setorAlvo] = opsSnapshot; }
+                if (registrosSnapshot !== undefined) { update['_registros_atv'] = {}; update['_registros_atv'][setorAlvo] = registrosSnapshot; }
+                transaction.set(docRef, update, { merge: true });
+                return setorSnapshot._versao;
+            });
+        }).then(function(novaVersao){
+            _sectorVersions[setorAlvo] = novaVersao;
+            mostrarIndicadorNuvem();
+            _syncRetryCount = 0;
+        }).catch(function(e){
+            if (e && e._conflito) {
+                mostrarToast('⚠️ Outro usuário alterou este setor — recarregando dados mais recentes...', true);
+                carregarDoFirestore(function(mudou){
+                    if (mudou && currentSector === setorAlvo) loadDataParaTela();
+                });
+                return;
+            }
+            console.warn('[Firebase] salvar dia:', e && e.message);
+            _syncRetryCount++;
+            if (_syncRetryCount <= _syncMaxRetries) {
+                setTimeout(function(){ salvarNoFirestore(); }, 5000 * _syncRetryCount);
+            } else {
+                console.warn('[Prumo] Sync falhou após ' + _syncMaxRetries + ' tentativas. Dados seguros no localStorage.');
+                _pendingSync = true;
+            }
+        });
     }
 
     /** Salva dados do dia + config no Firestore com debounce de 2s */
@@ -3997,6 +4047,7 @@
             var mudou = false;
             if (docs[0] && docs[0].exists) {
                 appData[workingDate] = docs[0].data() || {};
+                _atualizarVersoesConhecidas(appData[workingDate]);
                 mudou = true;
             }
             if (docs[1] && docs[1].exists) {
@@ -4014,7 +4065,11 @@
         });
     }
 
-    function _cachearLocal() { /* desativado — dados persistidos apenas via Firestore */ }
+    /** Cache local só para não perder dados se a internet cair — Firestore continua
+     *  sendo a fonte primária (carregado sempre que a nuvem responde). */
+    function _cachearLocal() {
+        try { localStorage.setItem('gestaoOpDatabase', JSON.stringify(appData)); } catch(e){}
+    }
 
     /** Escuta mudanças em tempo real — nuvem é fonte primária */
     function iniciarListenerFirestore() {
@@ -4025,6 +4080,7 @@
                 if (!doc.exists) return;
                 var remoteData = doc.data() || {};
                 appData[workingDate] = remoteData;
+                _atualizarVersoesConhecidas(remoteData);
                 // Preserve in-memory edits: if user is actively editing productivity view,
                 // don't let a Firestore snapshot (triggered by our own debounced save) overwrite
                 // keystrokes that haven't been flushed yet.
